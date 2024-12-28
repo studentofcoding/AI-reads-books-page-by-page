@@ -27,6 +27,39 @@ This is one of 400+ fascinating projects in my collection! [Support me on Patreo
 - 💬 1-on-1 consultations (higher tiers)
 - 🎁 Exclusive discounts on AI tools & platforms (up to $180 value)
 
+## How to Use
+
+1. **Setup**
+   ```bash
+   # Clone the repository
+   git clone [repository-url]
+   cd [repository-name]
+
+   # Install requirements
+   pip install -r requirements.txt
+   ```
+
+2. **Configure**
+   - Place your PDF file in the project root directory
+   - Open `read_books.py` and update the `PDF_NAME` constant with your PDF filename
+   - (Optional) Adjust other constants like `ANALYSIS_INTERVAL` or `TEST_PAGES`
+
+3. **Run**
+   ```bash
+   python read_books.py
+   ```
+
+4. **Output**
+   The script will generate:
+   - `book_analysis/knowledge_bases/`: JSON files containing extracted knowledge
+   - `book_analysis/summaries/`: Markdown files with interval and final summaries
+   - `book_analysis/pdfs/`: Copy of your PDF file
+
+5. **Customization Options**
+   - Set `ANALYSIS_INTERVAL = None` to skip interval summaries
+   - Set `TEST_PAGES = None` to process entire book
+   - Adjust `MODEL` and `ANALYSIS_MODEL` for different AI models
+
 ### Configuration Constants
 
 - `PDF_NAME`: The name of the PDF file to be analyzed.
