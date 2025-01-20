@@ -15,7 +15,7 @@ The `read_books.py` script performs an intelligent page-by-page analysis of PDF 
 - 🚫 Smart content filtering (skips TOC, index pages, etc.)
 - 📂 Organized directory structure for outputs
 
-## ❤️ Support & Get 400+ AI Projects
+## ❤️Join my AI Community & Get 400+ AI Projects & 1000x Cursor Course
 
 This is one of 400+ fascinating projects in my collection! [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get:
 
