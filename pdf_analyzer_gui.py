@@ -17,6 +17,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle
 from reportlab.lib.units import inch
 from reportlab.lib.colors import black, blue, lightgrey, grey
 import re
+from gtts import gTTS
+import PyPDF2
 
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int)
@@ -83,11 +85,54 @@ class AnalysisWorker(QThread):
     def stop(self):
         self.running = False
 
+class AudioConversionWorker(QThread):
+    progress = pyqtSignal(int)
+    log = pyqtSignal(str)
+    finished = pyqtSignal(bool)
+    error = pyqtSignal(str)
+    
+    def __init__(self, pdf_path):
+        super().__init__()
+        self.pdf_path = pdf_path
+        
+    def run(self):
+        try:
+            # Extract text from PDF
+            with open(self.pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                total_pages = len(pdf_reader.pages)
+                text_content = []
+                
+                for i, page in enumerate(pdf_reader.pages):
+                    text_content.append(page.extract_text())
+                    self.progress.emit(int((i + 1) / total_pages * 50))  # First 50% for extraction
+                    
+            full_text = ' '.join(text_content)
+            
+            # Convert to audio
+            self.log.emit("\n🔊 Converting text to speech...")
+            audio_path = Path(self.pdf_path).parent / f"{Path(self.pdf_path).stem}.mp3"
+            
+            tts = gTTS(text=full_text, lang='en', slow=False)
+            tts.save(str(audio_path))
+            
+            self.progress.emit(100)
+            self.log.emit(f"\n🎵 Audio book saved to: {audio_path}")
+            self.finished.emit(True)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit(False)
+
+    def stop(self):
+        self.running = False
+
 class PDFAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.total_pages = 0
         self.current_summary_path = None  # Track current summary path
+        self.current_pdf_path = None  # Track current PDF path
         self.initUI()
 
     def update_config_based_on_pdf(self, pdf_path):
@@ -217,9 +262,15 @@ class PDFAnalyzerGUI(QMainWindow):
         self.convert_button.clicked.connect(self.convert_current_to_pdf)
         self.convert_button.setEnabled(False)  # Initially disabled
         
+        # Add audio conversion button
+        self.audio_button = QPushButton("Convert to Audio")
+        self.audio_button.clicked.connect(self.convert_to_audio)
+        self.audio_button.setEnabled(False)  # Initially disabled
+        
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         button_layout.addWidget(self.convert_button)
+        button_layout.addWidget(self.audio_button)
         
         # Add all sections to main layout
         layout.addWidget(file_group)
@@ -332,6 +383,12 @@ class PDFAnalyzerGUI(QMainWindow):
                 color: #666666;
                 border-color: #222222;
             }
+            QPushButton#audioButton {
+                background-color: #2ecc71;
+            }
+            QPushButton#audioButton:hover {
+                background-color: #27ae60;
+            }
         """)
 
     def browse_file(self):
@@ -427,10 +484,21 @@ class PDFAnalyzerGUI(QMainWindow):
                         if not self.check_pdf_version(latest_summary):
                             self.log_text.append("\n💡 PDF version not found. Click 'Convert to PDF' to create one.")
                             self.convert_button.setEnabled(True)
+                            self.audio_button.setEnabled(False)
                         else:
                             pdf_path = latest_summary.parent / f"{latest_summary.stem}.pdf"
+                            self.current_pdf_path = pdf_path  # Store PDF path
                             self.log_text.append(f"\n📄 PDF version available at: {pdf_path}")
                             self.convert_button.setEnabled(False)
+                            
+                            # Check if audio version exists
+                            audio_path = pdf_path.parent / f"{pdf_path.stem}.mp3"
+                            if audio_path.exists():
+                                self.log_text.append(f"\n🎵 Audio version available at: {audio_path}")
+                                self.audio_button.setEnabled(False)
+                            else:
+                                self.log_text.append("\n🔊 PDF can be converted to audio. Click 'Convert to Audio' to create one.")
+                                self.audio_button.setEnabled(True)
                         
                         self.status_label.setText("Showing last analysis")
                         return
@@ -709,6 +777,8 @@ class PDFAnalyzerGUI(QMainWindow):
             doc.build(story)
             
             self.log_text.append(f"\n📄 PDF version saved to: {pdf_file}")
+            self.current_pdf_path = pdf_file  # Store PDF path
+            self.audio_button.setEnabled(True)  # Enable audio conversion
             return pdf_file
             
         except Exception as e:
@@ -780,22 +850,67 @@ class PDFAnalyzerGUI(QMainWindow):
                         if not self.check_pdf_version(latest_summary):
                             self.log_text.append("\n💡 PDF version not found. Click 'Convert to PDF' to create one.")
                             self.convert_button.setEnabled(True)
+                            self.audio_button.setEnabled(False)
                         else:
                             pdf_path = latest_summary.parent / f"{latest_summary.stem}.pdf"
+                            self.current_pdf_path = pdf_path  # Store PDF path
                             self.log_text.append(f"\n📄 PDF version available at: {pdf_path}")
                             self.convert_button.setEnabled(False)
+                            self.audio_button.setEnabled(True)  # Enable audio conversion
                         
                 except Exception as e:
                     self.log_text.append(f"\nError reading summary: {str(e)}")
         else:
             self.status_label.setText("Analysis stopped by user.")
             self.convert_button.setEnabled(False)
+            self.audio_button.setEnabled(False)
 
     def handle_error(self, error_msg):
         self.log_text.append(f"\nError: {error_msg}")
         self.status_label.setText("Error occurred during analysis")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
+    def convert_to_audio(self):
+        """Convert PDF to audio book"""
+        if not self.current_pdf_path:
+            return
+            
+        try:
+            self.log_text.append("\n🎵 Converting to audio book...")
+            self.audio_button.setEnabled(False)
+            self.status_label.setText("Converting to audio...")
+            
+            # Create audio worker to prevent UI freeze
+            self.audio_worker = AudioConversionWorker(self.current_pdf_path)
+            self.audio_worker.progress.connect(self.update_audio_progress)
+            self.audio_worker.log.connect(self.update_log)
+            self.audio_worker.finished.connect(self.audio_conversion_finished)
+            self.audio_worker.error.connect(self.handle_error)
+            
+            self.audio_worker.start()
+            
+        except Exception as e:
+            self.log_text.append(f"\n⚠️ Error starting audio conversion: {str(e)}")
+            self.audio_button.setEnabled(True)
+            
+    def update_audio_progress(self, value):
+        """Update progress bar for audio conversion"""
+        self.progress_bar.setValue(value)
+        
+    def audio_conversion_finished(self, success):
+        """Handle audio conversion completion"""
+        self.audio_button.setEnabled(False)  # Disable after successful conversion
+        if success:
+            self.status_label.setText("Audio conversion completed!")
+            # Check for audio file
+            if self.current_pdf_path:
+                audio_path = Path(self.current_pdf_path).parent / f"{Path(self.current_pdf_path).stem}.mp3"
+                if audio_path.exists():
+                    self.log_text.append(f"\n🎵 Audio version available at: {audio_path}")
+        else:
+            self.status_label.setText("Audio conversion failed")
+            self.audio_button.setEnabled(True)  # Re-enable on failure
 
 def main():
     app = QApplication(sys.argv)
