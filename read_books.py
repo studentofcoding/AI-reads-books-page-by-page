@@ -3,26 +3,110 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 import json
 from openai import OpenAI
-import fitz  # PyMuPDF
+from PyPDF2 import PdfReader
 from termcolor import colored
 from datetime import datetime
 import shutil
+import sys
+import argparse
+import pickle
 
-# source for the infinite descent book: https://infinitedescent.xyz/dl/infdesc.pdf
 
 # Configuration Constants
-PDF_NAME = "meditations.pdf"
+PDF_NAME = "dllm.pdf"  # Default value, can be overridden by command line
 BASE_DIR = Path("book_analysis")
 PDF_DIR = BASE_DIR / "pdfs"
 KNOWLEDGE_DIR = BASE_DIR / "knowledge_bases"
 SUMMARIES_DIR = BASE_DIR / "summaries"
 PDF_PATH = PDF_DIR / PDF_NAME
 OUTPUT_PATH = KNOWLEDGE_DIR / f"{PDF_NAME.replace('.pdf', '_knowledge.json')}"
-ANALYSIS_INTERVAL = 20  # Set to None to skip interval analyses, or a number (e.g., 10) to generate analysis every N pages
+ANALYSIS_INTERVAL = 5  # Set to None to skip interval analyses, or a number (e.g., 10) to generate analysis every N pages
 MODEL = "gpt-4o-mini"
 ANALYSIS_MODEL = "o1-mini"
-TEST_PAGES = 60  # Set to None to process entire book
+TEST_PAGES = 20  # Set to None to process entire book
+CONTEXT_WINDOW = 5  # Number of previous analyses to consider when generating new summary
 
+# Add new constant for progress tracking
+PROGRESS_DIR = BASE_DIR / "progress"
+
+# Add these at the top with other imports
+progress_callback = None
+
+def set_progress_callback(callback):
+    global progress_callback
+    progress_callback = callback
+
+def update_paths():
+    """Update paths when PDF_NAME changes"""
+    global PDF_PATH, OUTPUT_PATH
+    PDF_PATH = PDF_DIR / PDF_NAME
+    pdf_stem = Path(PDF_NAME).stem
+    OUTPUT_PATH = KNOWLEDGE_DIR / f"{pdf_stem}_knowledge.json"
+
+def main():
+    args = parse_arguments()
+    
+    # Update configuration based on command line arguments
+    global PDF_NAME
+    
+    # Use command-line argument if provided, otherwise use default PDF_NAME
+    if args.pdf_name is not None:
+        PDF_NAME = args.pdf_name
+        update_paths()  # Update paths with new PDF_NAME
+
+    setup_directories()
+    client = OpenAI()
+    
+    # Load saved progress if exists
+    start_page, knowledge_base, previous_analyses, last_analysis_count = load_progress()
+    
+    # If no progress found, start fresh
+    if start_page == -1:
+        knowledge_base = load_existing_knowledge()
+        start_page = 0
+        previous_analyses = []
+        last_analysis_count = 0
+
+    # Get actual page count first
+    with open(PDF_PATH, 'rb') as file:
+        pdf_reader = PdfReader(file)
+        total_pages = len(pdf_reader.pages)
+    
+    # Adjust TEST_PAGES if it exceeds total pages
+    TEST_PAGES = min(args.test_pages, total_pages) if args.test_pages > 0 else None
+    ANALYSIS_INTERVAL = None if args.interval == 0 else args.interval
+    
+    # Process pages with progress tracking
+    if TEST_PAGES is not None:
+        end_page = min(TEST_PAGES, total_pages)
+        knowledge_base, previous_analyses, last_analysis_count = process_pages(
+            client, PDF_PATH, start_page, end_page,
+            knowledge_base, previous_analyses, last_analysis_count
+        )
+        
+        if end_page < total_pages:
+            # Remove the input prompt and continue processing
+            knowledge_base, previous_analyses, last_analysis_count = process_pages(
+                client, PDF_PATH, end_page, total_pages,
+                knowledge_base, previous_analyses, last_analysis_count
+            )
+    else:
+        # Process all pages if TEST_PAGES is None
+        print(colored(f"\n📚 Processing all {total_pages} pages...", "cyan"))
+        knowledge_base, previous_analyses, last_analysis_count = process_pages(
+            client, PDF_PATH, start_page, total_pages,
+            knowledge_base, previous_analyses, last_analysis_count
+        )
+    
+    # Always generate final analysis at the end
+    print(colored(f"\n📊 All {total_pages} pages processed", "cyan"))
+    final_summary = analyze_knowledge_base(client, knowledge_base, previous_analyses)
+    save_summary(final_summary, is_final=True)
+    
+    # Clear progress file after successful completion
+    clear_progress()
+    
+    print(colored("\n✨ Processing complete! ✨", "green", attrs=['bold']))
 
 class PageContent(BaseModel):
     has_content: bool
@@ -36,7 +120,7 @@ def load_or_create_knowledge_base() -> Dict[str, Any]:
     return {}
 
 def save_knowledge_base(knowledge_base: list[str]):
-    output_path = KNOWLEDGE_DIR / f"{PDF_NAME.replace('.pdf', '')}_knowledge.json"
+    output_path = KNOWLEDGE_DIR / f"{Path(PDF_NAME).stem}_knowledge.json"
     print(colored(f"💾 Saving knowledge base ({len(knowledge_base)} items)...", "blue"))
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump({"knowledge": knowledge_base}, f, indent=2)
@@ -98,7 +182,7 @@ def process_page(client: OpenAI, page_text: str, current_knowledge: list[str], p
     return updated_knowledge
 
 def load_existing_knowledge() -> list[str]:
-    knowledge_file = KNOWLEDGE_DIR / f"{PDF_NAME.replace('.pdf', '')}_knowledge.json"
+    knowledge_file = KNOWLEDGE_DIR / f"{Path(PDF_NAME).stem}_knowledge.json"
     if knowledge_file.exists():
         print(colored("📚 Loading existing knowledge base...", "cyan"))
         with open(knowledge_file, 'r', encoding='utf-8') as f:
@@ -108,51 +192,163 @@ def load_existing_knowledge() -> list[str]:
     print(colored("🆕 Starting with fresh knowledge base", "cyan"))
     return []
 
-def analyze_knowledge_base(client: OpenAI, knowledge_base: list[str]) -> str:
+def analyze_knowledge_base(client: OpenAI, knowledge_base: list[str], previous_analyses: list[str] = None) -> str:
     if not knowledge_base:
         print(colored("\n⚠️  Skipping analysis: No knowledge points collected", "yellow"))
         return ""
         
-    print(colored("\n🤔 Generating final book analysis...", "cyan"))
+    print(colored("\n🤔 Generating analysis...", "cyan"))
+    
+    analysis_instructions = """Create a comprehensive and detailed summary of NEW content using markdown. Follow these guidelines carefully:
+
+    Difficulty Rating:
+    Rate each section's complexity:
+    🟢 Basic - Fundamental concepts, no prior knowledge needed
+    🟡 Intermediate - Builds on basic concepts
+    🔴 Advanced - Requires strong understanding of prerequisites
+    
+    1. Book Context and Overview:
+       - Start with a "Quick Take" summary (2-3 sentences)
+       - Provide chapter/section number and title
+       - List key themes and topics covered
+       - Explain target audience and required background
+       - Rate section difficulty (🟢/🟡/🔴)
+
+    2. Key Concepts (Minimum 5):
+       - Start each concept with an "In Simple Terms" explanation
+       - Follow with "Deep Dive" technical details
+       - Use analogies and metaphors for complex ideas
+       - Show "Before → After" knowledge progression
+       - Include "Common Misconceptions" warnings
+       - Rate each concept's difficulty (🟢/🟡/🔴)
+
+    3. Technical Details:
+       - Begin with "ELI5" (Explain Like I'm 5) overview
+       - Use progressive disclosure - simple to complex
+       - Include "Quick Reference" tables
+       - Provide "Step-by-Step" breakdowns
+       - Add "Pro Tips" and "Gotchas"
+       - Show "Real-World Examples"
+
+    4. Visual Learning Aids:
+       | Concept | Simple Terms | Technical Details | Example |
+       |---------|--------------|-------------------|---------|
+       | ...     | ...          | ...               | ...     |
+
+    5. Knowledge Maps:
+       ```
+       [Prerequisite] → [Current Topic] → [Advanced Applications]
+           ↓               ↓                ↓
+       [Related-1]     [Related-2]     [Related-3]
+       ```
+
+    6. Practice and Application:
+       - "Try This" exercises
+       - "Think About" discussion points
+       - "What If" scenarios
+       - "Common Problems" and solutions
+       - "Real-World Applications"
+
+    7. Quick Reference Cards:
+       ```
+       📌 Quick Reference: [Topic]
+       -------------------------
+       Definition: 
+       Key Points:
+       - Point 1
+       - Point 2
+       Common Uses:
+       - Use 1
+       - Use 2
+       Watch Out For:
+       - Pitfall 1
+       - Pitfall 2
+       ```
+
+    8. Learning Path:
+       ```
+       Learning Journey:
+       [Beginner] → Basic Concepts (🟢)
+           ↓
+       [Intermediate] → Applied Knowledge (🟡)
+           ↓
+       [Advanced] → Expert Topics (🔴)
+       ```
+
+    9. Summary and Next Steps:
+       - "5-Minute Summary" for quick review
+       - "Key Takeaways" checklist
+       - "Next Topics" preview
+       - "Further Reading" suggestions
+       - "Practice Projects" ideas
+
+    Formatting Enhancements:
+    - Use 💡 for insights
+    - Use ⚠️ for warnings
+    - Use 📌 for key points
+    - Use 🔍 for detailed explanations
+    - Use 💪 for practice exercises
+    - Use 🌟 for pro tips
+    - Use 🤔 for common questions
+    - Use 📚 for references
+    - Use 🎯 for learning objectives
+    - Use ✅ for completion checklist
+
+    Previous Summary Topics:
+    {previous_topics}
+    
+    Remember to:
+    1. Use the "Explain, Example, Exercise" pattern
+    2. Include "Why This Matters" for each topic
+    3. Add "In Practice" scenarios
+    4. Provide "Common Mistakes" warnings
+    5. Create "Quick Review" sections
+    6. Use progressive complexity
+    7. Link to specific page numbers
+    8. Reference previous knowledge
+    
+    Current Content Analysis:
+    """.format(
+        previous_topics="\n".join([f"- {a[:100]}..." for a in previous_analyses[-CONTEXT_WINDOW:]] if previous_analyses else ["No previous analyses"])
+    )
+    
     completion = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": """Create a comprehensive summary of the provided content in a concise but detailed way, using markdown format.
-           
-            Use markdown formatting:
-            - ## for main sections
-            - ### for subsections
-            - Bullet points for lists
-            - `code blocks` for any code or formulas
-            - **bold** for emphasis
-            - *italic* for terminology
-            - > blockquotes for important notes
-            
-            Return only the markdown summary, nothing else. Do not say 'here is the summary' or anything like that before or after"""},
-            {"role": "user", "content": f"Analyze this content:\n" + "\n".join(knowledge_base)}
+            {
+                "role": "system", 
+                "content": analysis_instructions
+            },
+            {
+                "role": "user", 
+                "content": f"Analyze this new content batch:\n" + "\n".join(knowledge_base)
+            }
         ]
     )
     
-    print(colored("✨ Analysis generated successfully!", "green"))
     return completion.choices[0].message.content
 
 def setup_directories():
-    # Clear all previously generated files
-    for directory in [KNOWLEDGE_DIR, SUMMARIES_DIR]:
-        if directory.exists():
-            for file in directory.glob("*"):
-                file.unlink()  # Delete all files in these directories
-    
     # Create all necessary directories
-    for directory in [PDF_DIR, KNOWLEDGE_DIR, SUMMARIES_DIR]:
+    for directory in [PDF_DIR, KNOWLEDGE_DIR, SUMMARIES_DIR, PROGRESS_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
+    
+    # Clear only files related to current PDF
+    current_pdf_name = Path(PDF_NAME).stem  # Use stem to get filename without extension
+    if KNOWLEDGE_DIR.exists():
+        for file in KNOWLEDGE_DIR.glob(f"{current_pdf_name}_knowledge.*"):
+            file.unlink()
+    
+    if SUMMARIES_DIR.exists():
+        for file in SUMMARIES_DIR.glob(f"{current_pdf_name}_*"):
+            file.unlink()
     
     # Ensure PDF exists in correct location
     if not PDF_PATH.exists():
         source_pdf = Path(PDF_NAME)
         if source_pdf.exists():
             # Copy the PDF instead of moving it
-            shutil.copy2(source_pdf, PDF_PATH)
+            shutil.copy2(str(source_pdf), str(PDF_PATH))  # Convert paths to strings
             print(colored(f"📄 Copied PDF to analysis directory: {PDF_PATH}", "green"))
         else:
             raise FileNotFoundError(f"PDF file {PDF_NAME} not found")
@@ -163,14 +359,16 @@ def save_summary(summary: str, is_final: bool = False):
         return
         
     # Create markdown file with proper naming
+    pdf_stem = Path(PDF_NAME).stem
+    
     if is_final:
-        existing_summaries = list(SUMMARIES_DIR.glob(f"{PDF_NAME.replace('.pdf', '')}_final_*.md"))
+        existing_summaries = list(SUMMARIES_DIR.glob(f"{pdf_stem}_final_*.md"))
         next_number = len(existing_summaries) + 1
-        summary_path = SUMMARIES_DIR / f"{PDF_NAME.replace('.pdf', '')}_final_{next_number:03d}.md"
+        summary_path = SUMMARIES_DIR / f"{pdf_stem}_final_{next_number:03d}.md"
     else:
-        existing_summaries = list(SUMMARIES_DIR.glob(f"{PDF_NAME.replace('.pdf', '')}_interval_*.md"))
+        existing_summaries = list(SUMMARIES_DIR.glob(f"{pdf_stem}_interval_*.md"))
         next_number = len(existing_summaries) + 1
-        summary_path = SUMMARIES_DIR / f"{PDF_NAME.replace('.pdf', '')}_interval_{next_number:03d}.md"
+        summary_path = SUMMARIES_DIR / f"{pdf_stem}_interval_{next_number:03d}.md"
     
     # Create markdown content with metadata
     markdown_content = f"""# Book Analysis: {PDF_NAME}
@@ -183,70 +381,109 @@ Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 """
     
     print(colored(f"\n📝 Saving {'final' if is_final else 'interval'} analysis to markdown...", "cyan"))
-    with open(summary_path, 'w', encoding='utf-8') as f:  # Added encoding='utf-8'
+    with open(summary_path, 'w', encoding='utf-8') as f:
         f.write(markdown_content)
     print(colored(f"✅ Analysis saved to: {summary_path}", "green"))
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='PDF Book Analysis Tool')
+    parser.add_argument('pdf_name', type=str, nargs='?', default=None,
+                       help='Name of the PDF file to analyze')
+    parser.add_argument('--test-pages', type=int, default=60, 
+                       help='Number of pages to process in test mode. Set to 0 to process entire book')
+    parser.add_argument('--interval', type=int, default=20,
+                       help='Generate analysis every N pages. Set to 0 to skip interval analyses')
+    return parser.parse_args()
+
 def print_instructions():
-    print(colored("""
+    print(colored(f"""
 📚 PDF Book Analysis Tool 📚
 ---------------------------
-1. Place your PDF in the same directory as this script
-2. Update PDF_NAME constant with your PDF filename
-3. The script will:
-   - Process the book page by page
-   - Extract and save knowledge points
-   - Generate interval summaries (if enabled)
-   - Create a final comprehensive analysis
+Processing file: {PDF_NAME}
 
-Configuration options:
-- ANALYSIS_INTERVAL: Set to None to skip interval analyses, or a number for analysis every N pages
-- TEST_PAGES: Set to None to process entire book, or a number for partial processing
+Configuration:
+- Test Pages: {"All pages" if TEST_PAGES is None else f"First {TEST_PAGES} pages"}
+- Analysis Interval: {"Disabled" if ANALYSIS_INTERVAL is None else f"Every {ANALYSIS_INTERVAL} pages"}
 
-Press Enter to continue or Ctrl+C to exit...
+Starting analysis...
 """, "cyan"))
 
-def main():
-    try:
-        print_instructions()
-        input()
-    except KeyboardInterrupt:
-        print(colored("\n❌ Process cancelled by user", "red"))
-        return
+def save_progress(page_num: int, knowledge_base: list[str], previous_analyses: list[str], last_analysis_count: int):
+    """Save current processing progress"""
+    progress_file = PROGRESS_DIR / f"{Path(PDF_NAME).stem}_progress.pkl"
+    progress = {
+        'last_page': page_num,
+        'knowledge_base': knowledge_base,
+        'previous_analyses': previous_analyses,
+        'last_analysis_count': last_analysis_count,
+        'timestamp': datetime.now()
+    }
+    with open(progress_file, 'wb') as f:
+        pickle.dump(progress, f)
+    print(colored(f"💾 Progress saved at page {page_num + 1}", "blue"))
 
-    setup_directories()
-    client = OpenAI()
+def load_progress() -> tuple[int, list[str], list[str], int]:
+    """Load previous processing progress"""
+    progress_file = PROGRESS_DIR / f"{Path(PDF_NAME).stem}_progress.pkl"
+    if progress_file.exists():
+        with open(progress_file, 'rb') as f:
+            progress = pickle.load(f)
+            print(colored(f"📚 Found saved progress from {progress['timestamp']}", "cyan"))
+            print(colored(f"⏩ Resuming from page {progress['last_page'] + 1}", "cyan"))
+            return (
+                progress['last_page'],
+                progress['knowledge_base'],
+                progress['previous_analyses'],
+                progress['last_analysis_count']
+            )
+    return -1, [], [], 0
+
+def clear_progress():
+    """Clear progress file after successful completion"""
+    progress_file = PROGRESS_DIR / f"{Path(PDF_NAME).stem}_progress.pkl"
+    if progress_file.exists():
+        progress_file.unlink()
+
+def process_pages(client: OpenAI, pdf_path, start_page: int, end_page: int, 
+                 knowledge_base: list[str], previous_analyses: list[str], last_analysis_count: int) -> tuple[list[str], list[str], int]:
+    """Process a range of pages with error handling and progress saving"""
+    total_pages = end_page - start_page
+    with open(pdf_path, 'rb') as file:
+        pdf_reader = PdfReader(file)
+        for page_num in range(start_page, end_page):
+            try:
+                # Update progress
+                if progress_callback:
+                    progress = (page_num - start_page + 1) / total_pages * 100
+                    progress_callback(progress)
+                    
+                page = pdf_reader.pages[page_num]
+                page_text = page.extract_text()
+                
+                knowledge_base = process_page(client, page_text, knowledge_base, page_num)
+                
+                # Generate interval analysis if ANALYSIS_INTERVAL is set
+                if ANALYSIS_INTERVAL:
+                    is_interval = (page_num + 1) % ANALYSIS_INTERVAL == 0
+                    is_final_page = page_num + 1 == end_page
+                    
+                    if is_interval and not is_final_page:
+                        print(colored(f"\n📊 Progress: {page_num + 1}/{end_page} pages processed", "cyan"))
+                        new_knowledge = knowledge_base[last_analysis_count:]
+                        interval_summary = analyze_knowledge_base(client, new_knowledge, previous_analyses)
+                        previous_analyses.append(interval_summary)
+                        last_analysis_count = len(knowledge_base)
+                        save_summary(interval_summary, is_final=False)
+                
+                # Save progress after each page
+                save_progress(page_num, knowledge_base, previous_analyses, last_analysis_count)
+                
+            except Exception as e:
+                print(colored(f"\n⚠️ Error processing page {page_num + 1}: {str(e)}", "red"))
+                print(colored("Progress saved. You can restart the script to continue from this point.", "yellow"))
+                return knowledge_base, previous_analyses, last_analysis_count
     
-    # Load or initialize knowledge base
-    knowledge_base = load_existing_knowledge()
-    
-    pdf_document = fitz.open(PDF_PATH)
-    pages_to_process = TEST_PAGES if TEST_PAGES is not None else pdf_document.page_count
-    
-    print(colored(f"\n📚 Processing {pages_to_process} pages...", "cyan"))
-    for page_num in range(min(pages_to_process, pdf_document.page_count)):
-        page = pdf_document[page_num]
-        page_text = page.get_text()
-        
-        knowledge_base = process_page(client, page_text, knowledge_base, page_num)
-        
-        # Generate interval analysis if ANALYSIS_INTERVAL is set
-        if ANALYSIS_INTERVAL:
-            is_interval = (page_num + 1) % ANALYSIS_INTERVAL == 0
-            is_final_page = page_num + 1 == pages_to_process
-            
-            if is_interval and not is_final_page:
-                print(colored(f"\n📊 Progress: {page_num + 1}/{pages_to_process} pages processed", "cyan"))
-                interval_summary = analyze_knowledge_base(client, knowledge_base)
-                save_summary(interval_summary, is_final=False)
-        
-        # Always generate final analysis on last page
-        if page_num + 1 == pages_to_process:
-            print(colored(f"\n📊 Final page ({page_num + 1}/{pages_to_process}) processed", "cyan"))
-            final_summary = analyze_knowledge_base(client, knowledge_base)
-            save_summary(final_summary, is_final=True)
-    
-    print(colored("\n✨ Processing complete! ✨", "green", attrs=['bold']))
+    return knowledge_base, previous_analyses, last_analysis_count
 
 if __name__ == "__main__":
     main()
